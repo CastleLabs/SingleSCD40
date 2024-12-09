@@ -4,7 +4,7 @@ import time
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 import configparser
-from Adafruit_IO import Client, RequestError, Feed
+from Adafruit_IO import Client, RequestError
 from threading import Thread, Event
 import os
 import busio
@@ -40,11 +40,17 @@ shutdown_event = Event()
 # Global variable for Adafruit IO client
 adafruit_io_client = None
 
-# Global state tracking for alerts
+# Global state tracking for alerts and counters
 alert_states = {
     'high_temp': False,
     'low_temp': False,
     'high_co2': False
+}
+
+alert_counters = {
+    'high_temp': 0,
+    'low_temp': 0,
+    'high_co2': 0
 }
 
 def send_slack_alert(message):
@@ -237,7 +243,7 @@ def reboot_system():
 
 def run_monitoring():
     """Main monitoring function"""
-    global adafruit_io_client, alert_states
+    global adafruit_io_client, alert_states, alert_counters
 
     # Read settings
     try:
@@ -246,15 +252,15 @@ def run_monitoring():
         # Initialize Adafruit IO client
         adafruit_io_client = Client(settings['ADAFRUIT_IO_USERNAME'],
                                   settings['ADAFRUIT_IO_KEY'])
-        group_name = settings['ADAFRUIT_IO_GROUP_NAME']  # Should be 'castle-sensors'
+        group_name = settings['ADAFRUIT_IO_GROUP_NAME']  # e.g., 'castle-sensors'
         logger.info(f"Adafruit IO client initialized successfully for group {group_name}")
     except Exception as e:
         log_error(f"Failed to initialize settings or Adafruit IO client: {e}")
         sys.exit(1)
 
     try:
-        # Initialize I2C with corrected pins
-        i2c = busio.I2C(3, 2)  # Replace with appropriate I2C pins
+        # Initialize I2C for SCD4x sensor
+        i2c = busio.I2C(3, 2)  # Replace with appropriate I2C pins if different
         sensor = adafruit_scd4x.SCD4X(i2c)
         sensor.start_periodic_measurement()
         logger.info("SCD4X sensor initialized successfully")
@@ -277,43 +283,56 @@ def run_monitoring():
                     humidity = sensor.relative_humidity
                     co2 = sensor.CO2
 
-                    logger.info(f"Read values - Temp: {temperature_f}°F ({temperature_c}°C), Humidity: {humidity}%, CO2: {co2}ppm")
+                    logger.info(f"Read values - Temp: {temperature_f:.1f}°F ({temperature_c:.1f}°C), Humidity: {humidity:.1f}%, CO2: {co2}ppm")
 
-                    # Check high temperature threshold
-                    is_temp_high = temperature_f >= settings['SENSOR_THRESHOLD_TEMP']
-                    if is_temp_high != alert_states['high_temp']:
-                        alert_states['high_temp'] = is_temp_high
-                        if is_temp_high:
-                            alert_msg = (f"🔥 High temperature alert at {settings['SENSOR_LOCATION_NAME']}: "
-                                       f"{temperature_f:.1f}°F ({temperature_c:.1f}°C)")
-                        else:
-                            alert_msg = (f"✅ Temperature returned to normal at {settings['SENSOR_LOCATION_NAME']}: "
-                                       f"{temperature_f:.1f}°F ({temperature_c:.1f}°C)")
-                        send_slack_alert(alert_msg)
+                    # Temperature High Threshold
+                    if temperature_f >= settings['SENSOR_THRESHOLD_TEMP']:
+                        alert_counters['high_temp'] += 1
+                        if alert_counters['high_temp'] >= settings['THRESHOLD_COUNT'] and not alert_states['high_temp']:
+                            alert_msg = f"🔥 High temperature alert at {settings['SENSOR_LOCATION_NAME']}: {temperature_f:.1f}°F ({temperature_c:.1f}°C)"
+                            send_slack_alert(alert_msg)
+                            alert_states['high_temp'] = True
+                    else:
+                        alert_counters['high_temp'] = 0
+                        if alert_states['high_temp']:
+                            alert_msg = f"✅ Temperature returned to normal at {settings['SENSOR_LOCATION_NAME']}: {temperature_f:.1f}°F ({temperature_c:.1f}°C)"
+                            send_slack_alert(alert_msg)
+                            alert_states['high_temp'] = False
 
-                    # Check low temperature threshold
-                    is_temp_low = temperature_f <= settings['SENSOR_LOWER_THRESHOLD_TEMP']
-                    if is_temp_low != alert_states['low_temp']:
-                        alert_states['low_temp'] = is_temp_low
-                        if is_temp_low:
-                            alert_msg = (f"❄️ Low temperature alert at {settings['SENSOR_LOCATION_NAME']}: "
-                                       f"{temperature_f:.1f}°F ({temperature_c:.1f}°C)")
-                        else:
-                            alert_msg = (f"✅ Temperature returned to normal at {settings['SENSOR_LOCATION_NAME']}: "
-                                       f"{temperature_f:.1f}°F ({temperature_c:.1f}°C)")
-                        send_slack_alert(alert_msg)
+                    # Temperature Low Threshold
+                    if temperature_f <= settings['SENSOR_LOWER_THRESHOLD_TEMP']:
+                        alert_counters['low_temp'] += 1
+                        if alert_counters['low_temp'] >= settings['THRESHOLD_COUNT'] and not alert_states['low_temp']:
+                            alert_msg = f"❄️ Low temperature alert at {settings['SENSOR_LOCATION_NAME']}: {temperature_f:.1f}°F ({temperature_c:.1f}°C)"
+                            send_slack_alert(alert_msg)
+                            alert_states['low_temp'] = True
+                    else:
+                        alert_counters['low_temp'] = 0
+                        if alert_states['low_temp']:
+                            alert_msg = f"✅ Temperature returned to normal at {settings['SENSOR_LOCATION_NAME']}: {temperature_f:.1f}°F ({temperature_c:.1f}°C)"
+                            send_slack_alert(alert_msg)
+                            alert_states['low_temp'] = False
 
-                    # Check CO2 threshold
-                    is_co2_high = co2 >= settings['SENSOR_CO2_THRESHOLD']
-                    if is_co2_high != alert_states['high_co2']:
-                        alert_states['high_co2'] = is_co2_high
-                        if is_co2_high:
-                            alert_msg = (f"⚠️ High CO2 alert at {settings['SENSOR_LOCATION_NAME']}: {co2}ppm")
-                        else:
-                            alert_msg = (f"✅ CO2 returned to normal at {settings['SENSOR_LOCATION_NAME']}: {co2}ppm")
-                        send_slack_alert(alert_msg)
+                    # CO2 High Threshold
+                    if co2 >= settings['SENSOR_CO2_THRESHOLD']:
+                        alert_counters['high_co2'] += 1
+                        if alert_counters['high_co2'] >= settings['THRESHOLD_COUNT'] and not alert_states['high_co2']:
+                            alert_msg = f"⚠️ High CO2 alert at {settings['SENSOR_LOCATION_NAME']}: {co2}ppm"
+                            send_slack_alert(alert_msg)
+                            alert_states['high_co2'] = True
+                    else:
+                        alert_counters['high_co2'] = 0
+                        if alert_states['high_co2']:
+                            alert_msg = f"✅ CO2 returned to normal at {settings['SENSOR_LOCATION_NAME']}: {co2}ppm"
+                            send_slack_alert(alert_msg)
+                            alert_states['high_co2'] = False
 
-                    # Send to Adafruit IO with group name (using Fahrenheit)
+                    # Log the readings to the log file
+                    with open(LOG_FILE, 'a') as file:
+                        timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+                        file.write(f"{timestamp} - {settings['SENSOR_LOCATION_NAME']} - Temperature: {temperature_f}°F, Humidity: {humidity}%, CO2: {co2}ppm\n")
+
+                    # Send the readings to Adafruit IO
                     send_to_adafruit(settings['ADAFRUIT_IO_TEMP_FEED'], temperature_f, settings['ADAFRUIT_IO_GROUP_NAME'])
                     send_to_adafruit(settings['ADAFRUIT_IO_HUMIDITY_FEED'], humidity, settings['ADAFRUIT_IO_GROUP_NAME'])
                     send_to_adafruit(settings['ADAFRUIT_IO_CO2_FEED'], co2, settings['ADAFRUIT_IO_GROUP_NAME'])
@@ -333,13 +352,16 @@ def signal_handler(signum, frame):
 
 
 if __name__ == '__main__':
+    # Handle shutdown signals
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
 
     try:
+        # Start the monitoring thread
         monitoring_thread = Thread(target=run_monitoring)
         monitoring_thread.start()
 
+        # Find an available port and start the Flask app
         port = find_available_port(5000)
         logger.info(f"Starting Flask app on port {port}...")
         app.run(host='0.0.0.0', port=port, debug=False)
@@ -348,3 +370,4 @@ if __name__ == '__main__':
     finally:
         shutdown_event.set()
         monitoring_thread.join()
+        logger.info("Application has been shut down gracefully.")
